@@ -1,0 +1,707 @@
+```{r}
+rm(list = ls())
+library(Rsubread)
+library(readxl)
+library(vsn)
+library(tsne)
+library(reshape2)
+library(xlsx)
+library(ggpubr)
+library(knitr)
+library(gridExtra)
+library(DESeq2)
+library(ggplot2)
+library(dplyr)
+library(ggrepel)
+library(PCAtools)
+library(ggalt)
+library(cowplot)
+library(org.Hs.eg.db)
+library(AnnotationDbi)
+library(ReactomePA)
+library(ReactomeContentService4R)
+library(tidyverse)
+library(enrichplot)
+library(DOSE)
+library(pheatmap)
+library(clusterProfiler)
+library(msigdbr)
+```
+
+```{r}
+H_t2g <- msigdbr(species = "Homo sapiens", category = "H") %>% dplyr::select(gs_name, entrez_gene)
+C1_t2g <- msigdbr(species = "Homo sapiens", category = "C1") %>% dplyr::select(gs_name, entrez_gene)
+C3_t2g <- msigdbr(species = "Homo sapiens", category = "C3") %>% dplyr::select(gs_name, entrez_gene)
+C6_t2g <- msigdbr(species = "Homo sapiens", category = "C6") %>% dplyr::select(gs_name, entrez_gene)
+msigdb <- bind_rows(H_t2g, C1_t2g, C3_t2g, C6_t2g)
+```
+
+```{r}
+validated_genes <- c("ICAM1", "ICAM2", "MMP2", "ITGA2", "CCL3L3", "CX3CL1", "CCL24",
+                     "NDP", "DACT2", "KLF8", "RNF43", "SERPINA5", "FGFR2", "BRD4")
+```
+
+```{r}
+subread.counts <- readRDS("subreadcounts.rds")
+```
+
+```{r}
+rawtable <- read.csv("rawtable.csv")
+rcounts <- rawtable[,-1]
+rownames(rcounts) <- rawtable[,1] 
+```
+
+```{r}
+cnt <- rcounts[(rowSums(rcounts)>0),] 
+colnames(cnt) <- sub("Aligned.out.bam", "", colnames(cnt))
+colnames(cnt) <- sub("_R1_001.fastq.gz", "", colnames(cnt))
+colnames(cnt) <- sub("X16140.00", "", colnames(cnt))
+dim(cnt)
+head(cnt)
+```
+```{r}
+human_biotype <- read.csv("/Users/GoksuAvar/Desktop/TNIK Project/GCF_000001405.39_GRCh38.p13_feature_table.tsv", row.names = NULL, sep="\t")
+```
+
+```{r}
+coding_genes <- human_biotype %>%
+  dplyr::filter(class == "protein_coding" | class == "with_protein")
+#write.xlsx(coding_genes, "Coding Genes List.xlsx")#, overwrite=TRUE)
+```
+
+```{r}
+cnt <- subset(cnt, rownames(cnt) %in% coding_genes$symbol)
+```
+
+```{r}
+geneLength <- subread.counts$annotation %>%
+  dplyr::select("GeneID", "Length")
+```
+
+```{r}
+#make countdata a dataframe
+countdata <- data.frame(GeneID=rownames(cnt), cnt)
+countdata <- geneLength %>%
+  inner_join(countdata) %>%
+  mutate(Length=ifelse(Length-75+1>0,Length-75+1,1))
+tpm<-countdata %>%
+  pivot_longer( cols = starts_with("X"), names_to = "sample", 
+                values_to = "cnt") %>% 
+  group_by(sample) %>%
+  mutate(rpk = cnt/ (Length/1000) , libSize = sum(rpk), tpm = rpk / libSize *1e6 )
+```
+
+```{r}
+tpm <- tpm %>% mutate( minTPM= min(tpm[tpm>0]), log10TPM = log10(tpm+minTPM))
+head(tpm)
+```
+
+```{r}
+# let's remove columns with intermediate results
+tpm <- tpm %>% dplyr::select(-libSize,-rpk,-minTPM)
+png(file="TPM_filtered.png")
+ggplot(tpm,aes(x=sample,y=log10TPM))+ 
+  geom_boxplot()+
+  coord_flip()+ 
+  ylab(expression(log[10](TPM)))+
+  ggtitle("TPM (Filtered)")
+dev.off()
+```
+
+```{r}
+tpm %>% summarise(no.of.genes=sum( tpm>=1 ))
+```
+
+```{r}
+#the tibble tpm is grouped according to samples, this grouping needs to be removed
+tpm2<-tpm %>% 
+  ungroup() %>% 
+  group_by(GeneID) %>%
+  dplyr::filter(sum(tpm<1) < 15)
+cnt.tib <- tpm2 %>% dplyr::select(GeneID,sample,cnt) %>% pivot_wider(names_from = sample,
+values_from = cnt )
+#DEseq wants a count matrix not a tibble
+cnt.filt<-as.matrix(cnt.tib[,-1]) 
+rownames(cnt.filt)<-cnt.tib$GeneID
+write.csv(cnt.filt, "Counts_Filtered.csv")
+```
+
+```{r}
+coldata <- read.csv2("coldata.csv")
+order_cols <- coldata$Sample_ID
+cnt <-  cnt[,order_cols]
+coldata <- as.matrix(coldata, rownames.force = NA)
+rownames(coldata) <- coldata[,1]
+dim(cnt)
+head(cnt)
+```
+```{r}
+all(rownames(coldata) %in% colnames(cnt))
+```
+
+```{r}
+all(rownames(coldata) == colnames(cnt))
+```
+
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = cnt,
+                              colData = coldata,
+                              design = ~Sample_Group)
+dds
+```
+
+```{r}
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+```
+
+```{r}
+dds<- DESeq(dds)
+```
+
+```{r}
+resultsNames(dds)
+```
+
+```{r}
+vsd <- vst(dds, blind=FALSE)
+vsdMat <- assay(vsd)
+```
+
+```{r}
+vsdmelted <- melt(vsdMat)
+
+pdf("VST.pdf")
+ggplot(vsdmelted, aes(x=Var2, y=value))+
+  geom_boxplot()+
+  coord_flip()+
+  ylab("Variance stabilized counts")+
+  xlab("Sample")+
+  ggtitle("VST")
+dev.off()
+```
+
+```{r}
+rlog <- rlog(dds)
+rlogMat <- assay(rlog)
+rlogmelted <- melt(rlogMat)
+
+pdf("rlog.pdf")
+ggplot(rlogmelted, aes(x=Var2, y=value))+
+  geom_boxplot()+
+  coord_flip()+
+  ylab("rlog transformed counts")+
+  xlab("Sample")+
+  ggtitle("rlog")
+dev.off()
+```
+
+```{r}
+pdf(file="PCA_rlog.pdf", height=6, width=8)
+pcaData <- plotPCA(rlog, intgroup=c("Sample_Group", "Mutation_Type"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=Sample_Group, shape=Mutation_Type)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  theme(axis.title = element_text(size = 10, face = "bold"))+
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  theme(axis.title = element_text(size = 10, face = "bold"))+
+  ggtitle("PCA") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line(), plot.title = element_text(size=15, face="bold")) +
+  geom_text_repel(aes(label=name), size=3, color="black", nudge_y = 1, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  scale_color_manual(values=c("deeppink3", "yellowgreen", "red3", "darkorange1"))+
+  geom_encircle(data=subset(pcaData, Sample_Group=="KO"))+
+  geom_encircle(data=subset(pcaData, Sample_Group=="WT"))+
+  geom_encircle(data=subset(pcaData, Sample_Group=="KOTGFB"))+
+  geom_encircle(data=subset(pcaData, Sample_Group=="WTTGFB"))+
+  coord_fixed()
+dev.off()
+```
+```{r}
+pdf(file="PCA_vst.pdf", height=6, width=8)
+pcaData <- plotPCA(vsd, intgroup=c("Sample_Group", "Mutation_Type"), returnData=TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+ggplot(pcaData, aes(PC1, PC2, color=Sample_Group, shape=Mutation_Type)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  theme(axis.title = element_text(size = 10, face = "bold"))+
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  theme(axis.title = element_text(size = 10, face = "bold"))+
+  ggtitle("PCA") +
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line(), plot.title = element_text(size=15, face="bold")) +
+  geom_text_repel(aes(label=name), size=3, color="black", nudge_y = 1, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = Inf)+
+  scale_color_manual(values=c("deeppink3", "yellowgreen", "red3", "darkorange1"))+
+  geom_encircle(data=subset(pcaData, Sample_Group=="KO"))+
+  geom_encircle(data=subset(pcaData, Sample_Group=="WT"))+
+  geom_encircle(data=subset(pcaData, Sample_Group=="KOTGFB"))+
+  geom_encircle(data=subset(pcaData, Sample_Group=="WTTGFB"))+
+  coord_fixed()
+dev.off()
+```
+
+```{r}
+res_ko_wt <- DESeq2::results(dds, contrast=c("Sample_Group","KO","WT"), alpha = 0.05)
+summary(res_ko_wt)
+```
+
+```{r}
+ko_wt_list<-data.frame(gene = rownames(res_ko_wt), res_ko_wt,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj") %>% dplyr::mutate(minuslogp = -log10(padj), "LFCminuslogp" = log2FoldChange*minuslogp) %>% rownames_to_column(var = "gene")
+
+ko_wt_sorted <- ko_wt_list %>% 
+  arrange(desc(abs(LFCminuslogp)))
+
+write.xlsx(ko_wt_sorted, "ko_wt_sorted.xlsx")
+
+pdf(file="Volcano_ko_wt.pdf", width=24, height=21)
+ggplot(ko_wt_list, aes(x=log2FoldChange, y=(minuslogp)))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=subset(ko_wt_list, minuslogp>(-log10(0.05))), size=2.25,color="darkorange1", alpha=1)+
+  geom_point(data=subset(ko_wt_list, minuslogp>(-log10(0.05)) & abs(log2FoldChange)>(1)), size=2.25,color="red3", alpha=1)+
+  geom_point(data=subset(ko_wt_list, minuslogp<(-log10(0.05)) & abs(log2FoldChange)>(1)), size=2.25,color="yellowgreen", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TNIK KO vs WT")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Log2FoldChange")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("-log10(p-adj)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = 1, linetype="dashed")+
+  geom_vline(xintercept = -1, linetype="dashed")+
+  geom_hline(yintercept = -log10(0.05), linetype="dashed")+
+  geom_label_repel(data=subset(ko_wt_list, minuslogp>(-log10(0.05)) | abs(log2FoldChange)>1), aes(label=gene), size=6, color="black", nudge_y = 0.5, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = 20)
+dev.off()
+
+pdf(file="Volcano_ko_wt_validated.pdf", width=24, height=21)
+ggplot(ko_wt_list, aes(x=log2FoldChange, y=(minuslogp)))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=subset(ko_wt_list, minuslogp>(-log10(0.05))), size=2.25,color="darkorange1", alpha=1)+
+  geom_point(data=subset(ko_wt_list, minuslogp>(-log10(0.05)) & abs(log2FoldChange)>(1)), size=2.25,color="red3", alpha=1)+
+  geom_point(data=subset(ko_wt_list, minuslogp<(-log10(0.05)) & abs(log2FoldChange)>(1)), size=2.25,color="yellowgreen", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TNIK KO vs WT")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Log2FoldChange")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("-log10(p-adj)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = 1, linetype="dashed")+
+  geom_vline(xintercept = -1, linetype="dashed")+
+  geom_hline(yintercept = -log10(0.05), linetype="dashed")+
+  geom_label_repel(data=subset(ko_wt_list, gene %in% validated_genes), aes(label=gene), size=6, color="black", nudge_y = 0.5, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = 20)
+dev.off()
+```
+```{r}
+res_ko_wt<-data.frame(rn=rownames(res_ko_wt),res_ko_wt) %>% na.omit()
+#make a named vector of P adjusted
+ko_wt_gsea <- res_ko_wt$padj 
+names(ko_wt_gsea) <- res_ko_wt$rn
+ensgEntrez_ko_wt_gsea <- AnnotationDbi::select(org.Hs.eg.db, keys=names(ko_wt_gsea), columns='ENTREZID', keytype='SYMBOL')
+df_ko_wt_gsea <- ensgEntrez_ko_wt_gsea %>%
+  dplyr::inner_join(res_ko_wt, by=c("SYMBOL"="rn")) %>% 
+  dplyr::select(ENTREZID,log2FoldChange,padj) %>% 
+  dplyr::group_by(ENTREZID) %>%
+  dplyr::summarise(lfc=mean(log2FoldChange), up=min(padj))
+ko_wt_lfc<-df_ko_wt_gsea$lfc 
+names(ko_wt_lfc)<-df_ko_wt_gsea$ENTREZID
+
+y_ko_wt_reac <- gsePathway(sort((ko_wt_lfc), decreasing=T), organism = "human", pvalueCutoff=1, pAdjustMethod="BH", verbose=F)
+y_ko_wt_reac  <- setReadable(y_ko_wt_reac , 'org.Hs.eg.db', 'ENTREZID')
+ko_wt_reac  <- y_ko_wt_reac@result
+ko_wt_reac  <- ko_wt_reac  %>% arrange(desc(NES)) %>% mutate(Source = "Reactome")
+
+
+y_ko_wt_kegg <- gseKEGG(sort((ko_wt_lfc), decreasing=T), organism = "hsa", pvalueCutoff=1, pAdjustMethod="BH", verbose=F)
+y_ko_wt_kegg  <- setReadable(y_ko_wt_kegg , 'org.Hs.eg.db', 'ENTREZID')
+ko_wt_kegg  <- y_ko_wt_kegg@result
+ko_wt_kegg  <- ko_wt_kegg  %>% arrange(desc(NES)) %>% mutate(Source = "KEGG")
+
+
+y_ko_wt_go <- gseGO(sort((ko_wt_lfc), decreasing=T), OrgDb=org.Hs.eg.db,
+                            ont   = "BP", pvalueCutoff=1, pAdjustMethod="BH", verbose=F)
+y_ko_wt_go <- setReadable(y_ko_wt_go, 'org.Hs.eg.db', 'ENTREZID')
+ko_wt_go <- y_ko_wt_go@result
+ko_wt_go <- ko_wt_go %>% arrange(desc(NES)) %>% mutate(Source = "GO")
+
+y_ko_wt_msigdb <- GSEA(sort((ko_wt_lfc), decreasing=T), pvalueCutoff=1, pAdjustMethod="BH", verbose=F, TERM2GENE = msigdb)
+y_ko_wt_msigdb <- setReadable(y_ko_wt_msigdb, 'org.Hs.eg.db', 'ENTREZID')
+ko_wt_msigdb <- y_ko_wt_msigdb@result
+ko_wt_msigdb <- ko_wt_msigdb %>% arrange(desc(NES)) %>% mutate(Source = "MSigDB")
+
+
+ko_wt_gsea_results <- rbind(ko_wt_go, ko_wt_kegg, ko_wt_msigdb, ko_wt_reac)
+
+pdf(file="Gsea_volcano_ko_wt.pdf", width=15, height=15)
+ggplot(ko_wt_gsea_results, aes(x=NES, y=(-log10(qvalues))))+
+  geom_point(aes(size=setSize),color="grey", alpha=0.5)+
+  scale_x_continuous(limits = c(-3,3), expand = expansion(mult = 0.5))+
+  geom_label_repel(data=subset(ko_wt_gsea_results, NES>1.5 & qvalues < 0.01), aes(label=Description), force_pull=0, force=5, nudge_x = 3, direction = "y", hjust = 0, segment.size = 0.2)+
+  geom_label_repel(data=subset(ko_wt_gsea_results, NES<(-1.5) & qvalues < 0.01), aes(label=Description), force=5, nudge_x = -3, hjust = 1, direction = "y", segment.size = 0.2)
+dev.off()
+
+
+msigdb_list_ko_wt <- c("HALLMARK_INTERFERON_GAMMA_RESPONSE",
+                             "HALLMARK_INTERFERON_ALPHA_RESPONSE",
+                             "HALLMARK_TNFA_SIGNALING_VIA_NFKB",
+                        "HALLMARK_KRAS_SIGNALING_UP",
+                        "HALLMARK_APICAL_JUNCTION",
+                       "HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",
+                       "chrXp11", "chrXp22", "chr7q11", "chr7q22")
+
+geneSetID_ko_wt_msigdb = match(msigdb_list_ko_wt,
+                              y_ko_wt_msigdb@result[["Description"]])
+
+pdf("gseaplot2_ko_wt_msigdb.pdf", width=12, height=10)
+gseaplot2(y_ko_wt_msigdb, geneSetID = geneSetID_ko_wt_msigdb[!is.na(geneSetID_ko_wt_msigdb)], 
+          pvalue_table = FALSE, 
+          title="TNIK KO vs WT Selected MSigDB Signatures", 
+          base_size = 18,
+          rel_heights = c(2.5,0.3,0.5))+
+  theme(axis.text = element_text(size=12, face = "bold"),
+        axis.title = element_text(size=16))
+dev.off()
+
+
+go_list_ko_wt <- c("lymphocyte chemotaxis", "response to interferon-gamma",
+                "granulocyte migration", "lymphocyte migration", "positive regulation of leukocyte migration", "neutrophil migration", "eosinophil migration")
+
+pdf("heatplot_ko_wt_msigdb.pdf", width = 60, height=6)
+enrichplot::heatplot(y_ko_wt_msigdb, 
+                     showCategory = msigdb_list_ko_wt, 
+                     foldChange = ko_wt_lfc)+
+  ggtitle("TNIK KO vs WT Selected MSigDB Signatures")+
+  theme(axis.text.y=element_text(size=12, face = "bold"),
+        axis.text.x=element_text(size=9, face="bold"),
+        plot.title = element_text(size = 24, face="bold"))
+dev.off()
+
+
+pdf("heatplot_ko_wt_go.pdf", width = 20, height=4)
+enrichplot::heatplot(y_ko_wt_go, 
+                     showCategory = go_list_ko_wt, 
+                     foldChange = ko_wt_lfc)+
+  ggtitle("TNIK KO vs WT Selected Signatures")+
+  theme(axis.text.y=element_text(size=12, face = "bold"),
+        axis.text.x=element_text(size=9, face="bold"),
+        plot.title = element_text(size = 24, face="bold"))
+dev.off()
+```
+
+```{r}
+res_ko_wt_sig_sort_p <-data.frame(gene = rownames(res_ko_wt), res_ko_wt,
+stringsAsFactors = F) %>% 
+  na.omit() %>%
+  filter(padj<0.05 & log2FoldChange < (-2.0)) %>%
+  arrange(padj) %>%
+  mutate(minuslogp = -log10(padj), minuslog2p = -log2(padj))
+
+sig_genelist_ko_wt <- res_ko_wt_sig_sort_p$gene
+
+coldata_df <- as.data.frame(coldata)
+df <- coldata_df %>% dplyr::select(Sample_Group, Mutation_Type)
+
+rownames(df) <- row.names(coldata)
+
+df <- df %>% dplyr::arrange(Sample_Group)
+df_ko_wt <- df %>% dplyr::filter(Sample_Group %in% c("WT","KO"))
+
+vsdMat_ko_wt <- vsdMat[,row.names(df_ko_wt)]
+
+pdf("Heatmap_siglist_ko_wt.pdf", width=14, height = 32)
+pheatmap(subset(vsdMat_ko_wt, rownames(vsdMat_ko_wt) %in% sig_genelist_ko_wt), cluster_rows=TRUE, show_rownames=TRUE,cluster_cols=TRUE, annotation_col=df_ko_wt, scale = "row", fontsize = 20, fontsize_col = 25, fontsize_row = 18, angle_col = 90, main="Genes with LFC <(-2.0) & padj<0.05 in KO vs WT")
+dev.off()
+```
+```{r}
+res_ko_wt_sig_sort_p <-data.frame(gene = rownames(res_ko_wt), res_ko_wt,
+stringsAsFactors = F) %>% 
+  na.omit() %>%
+  filter(padj<0.01 & abs(log2FoldChange) > 2.0) %>%
+  arrange(padj) %>%
+  mutate(minuslogp = -log10(padj), minuslog2p = -log2(padj))
+
+sig_genelist_ko_wt <- res_ko_wt_sig_sort_p$gene
+
+coldata_df <- as.data.frame(coldata)
+df <- coldata_df %>% dplyr::select(Sample_Group, Mutation_Type)
+
+rownames(df) <- row.names(coldata)
+
+df <- df %>% dplyr::arrange(Sample_Group)
+df_ko_wt <- df %>% dplyr::filter(Sample_Group %in% c("WT","KO"))
+
+vsdMat_ko_wt <- vsdMat[,row.names(df_ko_wt)]
+
+pdf("Heatmap_siglist_ko_wt.pdf", width=14, height = 40)
+pheatmap(subset(vsdMat_ko_wt, rownames(vsdMat_ko_wt) %in% sig_genelist_ko_wt), cluster_rows=TRUE, show_rownames=TRUE,cluster_cols=TRUE, annotation_col=df_ko_wt, scale = "row", fontsize = 20, fontsize_col = 25, fontsize_row = 18, angle_col = 90, main="Genes with |LFC| > 2.0 & padj<0.01 in KO vs WT")
+dev.off()
+```
+
+```{r}
+res_kotgfb_wttgfb <- DESeq2::results(dds, contrast=c("Sample_Group","KOTGFB","WTTGFB"), alpha = 0.05)
+summary(res_kotgfb_wttgfb)
+```
+
+```{r}
+kotgfb_wttgfb_list<-data.frame(gene = rownames(res_kotgfb_wttgfb), res_kotgfb_wttgfb,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj") %>% dplyr::mutate(minuslogp = -log10(padj), "LFCminuslogp" = log2FoldChange*minuslogp) %>% rownames_to_column(var = "gene")
+
+kotgfb_wttgfb_sorted <- kotgfb_wttgfb_list %>% 
+  arrange(desc(abs(LFCminuslogp)))
+
+write.xlsx(kotgfb_wttgfb_sorted, "kotgfb_wttgfb_sorted.xlsx")
+
+pdf(file="Volcano_kotgfb_wttgfb.pdf", width=24, height=21)
+ggplot(kotgfb_wttgfb_list, aes(x=log2FoldChange, y=(minuslogp)))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=subset(kotgfb_wttgfb_list, minuslogp>(-log10(0.05))), size=2.25,color="darkorange1", alpha=1)+
+  geom_point(data=subset(kotgfb_wttgfb_list, minuslogp>(-log10(0.05)) & abs(log2FoldChange)>(1)), size=2.25,color="red3", alpha=1)+
+  geom_point(data=subset(kotgfb_wttgfb_list, minuslogp<(-log10(0.05)) & abs(log2FoldChange)>(1)), size=2.25,color="yellowgreen", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TNIK KO vs WT")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Log2FoldChange")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("-log10(p-adj)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = 1, linetype="dashed")+
+  geom_vline(xintercept = -1, linetype="dashed")+
+  geom_hline(yintercept = -log10(0.05), linetype="dashed")+
+  geom_label_repel(data=subset(kotgfb_wttgfb_list, minuslogp>(-log10(0.05)) | abs(log2FoldChange)>1), aes(label=gene), size=6, color="black", fontface="bold")
+dev.off()
+
+pdf(file="Volcano_kotgfb_wttgfb_validated.pdf", width=24, height=21)
+ggplot(kotgfb_wttgfb_list, aes(x=log2FoldChange, y=(minuslogp)))+
+  geom_point(size=2.25,color="grey", alpha=0.5)+
+  geom_point(data=subset(kotgfb_wttgfb_list, minuslogp>(-log10(0.05))), size=2.25,color="darkorange1", alpha=1)+
+  geom_point(data=subset(kotgfb_wttgfb_list, minuslogp>(-log10(0.05)) & abs(log2FoldChange)>(1)), size=2.25,color="red3", alpha=1)+
+  geom_point(data=subset(kotgfb_wttgfb_list, minuslogp<(-log10(0.05)) & abs(log2FoldChange)>(1)), size=2.25,color="yellowgreen", alpha=1)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("TNIK KO vs WT")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("Log2FoldChange")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("-log10(p-adj)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = 1, linetype="dashed")+
+  geom_vline(xintercept = -1, linetype="dashed")+
+  geom_hline(yintercept = -log10(0.05), linetype="dashed")+
+  geom_label_repel(data=subset(kotgfb_wttgfb_list, gene %in% validated_genes), aes(label=gene), size=6, color="black", nudge_y = 0.5, fontface="bold",  min.segment.length = unit(0, "lines"), max.overlaps = 20)
+dev.off()
+```
+
+```{r}
+res_kotgfb_wttgfb<-data.frame(rn=rownames(res_kotgfb_wttgfb),res_kotgfb_wttgfb) %>% na.omit()
+#make a named vector of P adjusted
+kotgfb_wttgfb_gsea <- res_kotgfb_wttgfb$padj 
+names(kotgfb_wttgfb_gsea) <- res_kotgfb_wttgfb$rn
+ensgEntrez_kotgfb_wttgfb_gsea <- AnnotationDbi::select(org.Hs.eg.db, keys=names(kotgfb_wttgfb_gsea), columns='ENTREZID', keytype='SYMBOL')
+
+df_kotgfb_wttgfb_gsea <- ensgEntrez_kotgfb_wttgfb_gsea %>%
+  dplyr::inner_join(res_kotgfb_wttgfb, by=c("SYMBOL"="rn")) %>% 
+  dplyr::select(ENTREZID,log2FoldChange,padj) %>% 
+  dplyr::group_by(ENTREZID) %>%
+  dplyr::summarise(lfc=mean(log2FoldChange), up=min(padj))
+kotgfb_wttgfb_lfc<-df_kotgfb_wttgfb_gsea$lfc 
+names(kotgfb_wttgfb_lfc)<-df_kotgfb_wttgfb_gsea$ENTREZID
+
+y_kotgfb_wttgfb_reac <- gsePathway(sort((kotgfb_wttgfb_lfc), decreasing=T), organism = "human", pvalueCutoff=1, pAdjustMethod="BH", verbose=F)
+y_kotgfb_wttgfb_reac  <- setReadable(y_kotgfb_wttgfb_reac , 'org.Hs.eg.db', 'ENTREZID')
+kotgfb_wttgfb_reac  <- y_kotgfb_wttgfb_reac@result
+kotgfb_wttgfb_reac  <- kotgfb_wttgfb_reac  %>% arrange(desc(NES)) %>% mutate(Source = "Reactome")
+
+
+y_kotgfb_wttgfb_kegg <- gseKEGG(sort((kotgfb_wttgfb_lfc), decreasing=T), organism = "hsa", pvalueCutoff=1, pAdjustMethod="BH", verbose=F)
+y_kotgfb_wttgfb_kegg  <- setReadable(y_kotgfb_wttgfb_kegg , 'org.Hs.eg.db', 'ENTREZID')
+kotgfb_wttgfb_kegg  <- y_kotgfb_wttgfb_kegg@result
+kotgfb_wttgfb_kegg  <- kotgfb_wttgfb_kegg  %>% arrange(desc(NES)) %>% mutate(Source = "KEGG")
+
+
+y_kotgfb_wttgfb_go <- gseGO(sort((kotgfb_wttgfb_lfc), decreasing=T), OrgDb=org.Hs.eg.db,
+                            ont   = "BP", pvalueCutoff=1, pAdjustMethod="BH", verbose=F)
+y_kotgfb_wttgfb_go <- setReadable(y_kotgfb_wttgfb_go, 'org.Hs.eg.db', 'ENTREZID')
+kotgfb_wttgfb_go <- y_kotgfb_wttgfb_go@result
+kotgfb_wttgfb_go <- kotgfb_wttgfb_go %>% arrange(desc(NES)) %>% mutate(Source = "GO")
+
+y_kotgfb_wttgfb_msigdb <- GSEA(sort((kotgfb_wttgfb_lfc), decreasing=T), pvalueCutoff=1, pAdjustMethod="BH", verbose=F, TERM2GENE = msigdb)
+y_kotgfb_wttgfb_msigdb <- setReadable(y_kotgfb_wttgfb_msigdb, 'org.Hs.eg.db', 'ENTREZID')
+kotgfb_wttgfb_msigdb <- y_kotgfb_wttgfb_msigdb@result
+kotgfb_wttgfb_msigdb <- kotgfb_wttgfb_msigdb %>% arrange(desc(NES)) %>% mutate(Source = "MSigDB")
+
+
+kotgfb_wttgfb_gsea_results <- rbind(kotgfb_wttgfb_go, kotgfb_wttgfb_kegg, kotgfb_wttgfb_msigdb, kotgfb_wttgfb_reac)
+
+pdf(file="Gsea_volcano_ko_wt.pdf", width=15, height=15)
+ggplot(kotgfb_wttgfb_gsea_results, aes(x=NES, y=(-log10(qvalues))))+
+  geom_point(aes(size=setSize),color="grey", alpha=0.5)+
+  scale_x_continuous(limits = c(-3,3), expand = expansion(mult = 0.5))+
+  geom_label_repel(data=subset(kotgfb_wttgfb_gsea_results, NES>1.5 & qvalues < 0.01), aes(label=Description), force_pull=0, force=5, nudge_x = 3, direction = "y", hjust = 0, segment.size = 0.2)+
+  geom_label_repel(data=subset(kotgfb_wttgfb_gsea_results, NES<(-1.5) & qvalues < 0.01), aes(label=Description), force=5, nudge_x = -3, hjust = 1, direction = "y", segment.size = 0.2)
+dev.off()
+
+pathway_list_kotgfb_wttgfb <- c("Interferon gamma signaling",
+                             "Interleukin-10 signaling",
+                             "Interferon alpha/beta signaling",
+                        "GPCR ligand binding",
+                        "Class A/1 (Rhodopsin-like receptors)")
+
+geneSetID_kotgfb_wttgfb = match(pathway_list_kotgfb_wttgfb,
+                              y_kotgfb_wttgfb@result[["Description"]])
+
+pdf("gseaplot2_kotgfb_wttgfb.pdf", width=12, height=10)
+gseaplot2(y_kotgfb_wttgfb, geneSetID = geneSetID_kotgfb_wttgfb[!is.na(geneSetID_kotgfb_wttgfb)], 
+          pvalue_table = FALSE, 
+          title="TNIK KO vs WT Selected Pathways", 
+          base_size = 18,
+          rel_heights = c(2.5,0.3,0.5))+
+  theme(axis.text = element_text(size=12, face = "bold"),
+        axis.title = element_text(size=16))
+dev.off()
+
+pdf("heatplot_kotgfb_wttgfb.pdf", width = 20, height=5)
+enrichplot::heatplot(y_kotgfb_wttgfb, 
+                     showCategory = pathway_list_kotgfb_wttgfb, 
+                     foldChange = kotgfb_wttgfb_lfc)+
+  ggtitle("TNIK KO vs WT Selected Pathways")+
+  theme(axis.text.y=element_text(size=12, face = "bold"),
+        axis.text.x=element_text(size=9, face="bold"),
+        plot.title = element_text(size = 24, face="bold"))
+dev.off()
+```
+
+```{r}
+res_kotgfb_wttgfb_sig_sort_p <-data.frame(gene = rownames(res_kotgfb_wttgfb), res_kotgfb_wttgfb,
+stringsAsFactors = F) %>% 
+  na.omit() %>%
+  filter(padj<0.05 & log2FoldChange < (-2.0)) %>%
+  arrange(padj) %>%
+  mutate(minuslogp = -log10(padj), minuslog2p = -log2(padj))
+
+sig_genelist_kotgfb_wttgfb <- res_kotgfb_wttgfb_sig_sort_p$gene
+
+coldata_df <- as.data.frame(coldata)
+df <- coldata_df %>% dplyr::select(Sample_Group, Mutation_Type)
+
+rownames(df) <- row.names(coldata)
+
+df <- df %>% dplyr::arrange(Sample_Group)
+df_kotgfb_wttgfb <- df %>% dplyr::filter(Sample_Group %in% c("WT","KO"))
+
+vsdMat_kotgfb_wttgfb <- vsdMat[,row.names(df_kotgfb_wttgfb)]
+
+pdf("Heatmap_siglist_kotgfb_wttgfb.pdf", width=14, height = 32)
+pheatmap(subset(vsdMat_kotgfb_wttgfb, rownames(vsdMat_kotgfb_wttgfb) %in% sig_genelist_kotgfb_wttgfb), cluster_rows=TRUE, show_rownames=TRUE,cluster_cols=FALSE, annotation_col=df_kotgfb_wttgfb, scale = "row", fontsize = 20, fontsize_col = 25, fontsize_row = 18, angle_col = 90, main="Genes with LFC <(-2.0) & padj<0.05 in KO vs WT")
+dev.off()
+```
+
+```{r}
+common_gsea <- merge(ko_wt_gsea_results, kotgfb_wttgfb_gsea_results, by="ID", all=TRUE)
+for (i in 1:nrow(common_gsea)){
+  if(is.na(common_gsea$Description.x[i])){
+    common_gsea$Description.x[i] <- common_gsea$Description.y[i]
+    common_gsea$qvalues.x[i] <- 1}
+  if(is.na(common_gsea$Description.y[i])){
+    common_gsea$Description.y[i] <- common_gsea$Description.x[i]
+    common_gsea$qvalues.y[i] <- 1}}
+
+common_gsea <- common_gsea %>% mutate(Significance = ifelse(common_gsea$qvalues.x<=0.05 & common_gsea$qvalues.y<=0.05, "Both", ifelse(common_gsea$qvalues.x<=0.05 & common_gsea$qvalues.y>0.05, "Only without TGFB", ifelse(common_gsea$qvalues.x>0.05 & common_gsea$qvalues.y<=0.05, "Only with TGFB", "Neither"))))
+common_gsea$Significance <- as.factor(common_gsea$Significance)
+common_gsea_new <- common_gsea %>%
+  dplyr::filter(Significance != "Neither") %>%
+  dplyr::arrange(Significance) 
+common_gsea_new$qval_maximum = rowMaxs(as.matrix(common_gsea_new[,c(8,19)]))
+
+gsea_both <- common_gsea_new %>%
+  dplyr::filter(Significance == "Both") %>%
+  dplyr::arrange(qval_maximum)
+gsea_without_TGFB <- common_gsea_new %>%
+  dplyr::filter(Significance == "Only without TGFB") %>% 
+  dplyr::arrange(qvalues.y)
+gsea_with_TGFB <- common_gsea_new %>%
+  dplyr::filter(Significance == "Only with TGFB") %>% 
+  dplyr::arrange(qvalues.x)
+gsea_with_without <- bind_rows(gsea_without_TGFB, gsea_with_TGFB)
+common_gsea_new <- bind_rows(gsea_both, gsea_with_without)
+```
+
+```{r}
+a<-data.frame(gene = rownames(res_ko_wt), res_ko_wt,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj") %>% dplyr::mutate(minuslogp = -log10(padj), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+b<-data.frame(gene = rownames(res_kotgfb_wttgfb), res_kotgfb_wttgfb,
+stringsAsFactors = F) %>% na.omit() %>% dplyr::select("log2FoldChange", "padj")%>% dplyr::mutate(minuslogp = -log10(padj), lfcsign = log2FoldChange/abs(log2FoldChange), signlogp = lfcsign*minuslogp) 
+c <- merge(a,b,by=0)
+d <- c %>% 
+  dplyr::filter(padj.x<0.01, padj.y<0.01)
+e <- c %>%
+  dplyr::filter(padj.x < 0.05 | padj.y < 0.05)
+
+pdf(file="signlog.pdf", width=15, height=15)
+ggplot(c, aes(x=signlogp.x, y=signlogp.y))+
+  geom_point(size=2.25,color="grey", alpha=0.6)+
+  geom_point(data=d, size=2.25,color="red3", alpha=0.6)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) +
+  ggtitle("Cross Comparison")+
+  theme(plot.title = element_text(size = 30, face = "bold"))+
+  scale_x_continuous(limits = c(-200,200),  breaks = seq(-200, 200, by = 20))+
+  scale_y_continuous(limits = c(-200,200),  breaks = seq(-200, 200, by = 20))+
+  xlab("TNIK KO vs WT (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 20, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  ylab("TNIK KO vs WT with TGFB (sign(LFC) x -log10(p-adj))")+
+  theme(axis.title = element_text(size = 20, face = "bold"), axis.text=element_text(size=20, face = "bold"))+
+  geom_vline(xintercept = log10(0.01), linetype="dashed")+
+  geom_vline(xintercept = -log10(0.01), linetype="dashed")+
+  geom_hline(yintercept = log10(0.01), linetype="dashed")+
+  geom_hline(yintercept = -log10(0.01), linetype="dashed")+
+  geom_label_repel(data=subset(d, abs(minuslogp.x) > 40), aes(label=Row.names), size=6, color="black", fontface="bold", max.overlaps = Inf, min.segment.length = 0, force=5)
+dev.off()
+
+pdf(file="LFCcomparison.pdf", width=15, height=15)
+ggplot(c, aes(x=log2FoldChange.x, y=log2FoldChange.y))+
+  geom_point(size=2.5,color="grey", alpha=0.8)+
+  geom_point(data=subset(c, padj.x>0.05 & padj.y<0.05), size=2.25,color="red", alpha=0.6)+
+  geom_point(data=subset(c, padj.x<0.05 & padj.y>0.05), size=2.25,color="blue", alpha=0.6)+
+  geom_point(data=d, size=2.5,color="purple", alpha=0.6)+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+        panel.background = element_blank(),plot.background = element_blank(), axis.line = element_line()) + 
+  xlim(-4,7.5)+
+  ylim(-4,7.5)+
+  ggtitle("LFC Comparison at p-adj<0.01 (Cross Comparison)")+
+  theme(plot.title = element_text(size = 60, face = "bold"))+
+  xlab("TNIK KO vs WT (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=25, face = "bold"))+
+  ylab("TNIK KO vs WT with TGFB (LFC)")+
+  theme(axis.title = element_text(size = 40, face = "bold"), axis.text=element_text(size=25, face = "bold"))+
+  geom_label_repel(data=subset(d, log2FoldChange.x<(-1) & log2FoldChange.y<(-1)), aes(label=Row.names), size=7.5, color="black", nudge_y = 0.05, fontface = "bold", min.segment.length = unit(0.3, "lines"))+
+  geom_label_repel(data=subset(d, log2FoldChange.x>(0.5) & log2FoldChange.y<(0)), aes(label=Row.names), size=7.5, color="black", nudge_y = 0.05, fontface = "bold", min.segment.length = unit(0.3, "lines"))+
+  geom_label_repel(data=subset(d, log2FoldChange.x>2 | log2FoldChange.y<(-2.5)), aes(label=Row.names), size=7.5, color="black", nudge_y = 0.05, fontface = "bold", min.segment.length = unit(0.3, "lines"))+
+  stat_cor(data=d,method = "spearman", size=4, label.y = 5.5, label.x = -2.85, fontface="italic")+
+  annotate("text", x=-1.85, y=6.5, label="Spearman's Correlation of only\ncommonly significant genes", size = 4, fontface="italic")+
+  geom_hline(yintercept = 0, linetype="dashed")+
+  geom_vline(xintercept=0, linetype="dashed")
+dev.off()
+```
+```{r}
+pdf("sig_enrich_merged_scatter.pdf", width=12, height=8)
+ggplot(common_gsea, aes(x=NES.x, y=NES.y))+
+  geom_point(colour = "grey", alpha = 0.5)+
+  geom_point(data=subset(common_gsea,Significance=="Both"),
+             colour = "purple",size = 2,alpha = 0.7) +
+  geom_point(data=subset(common_gsea,Significance=="Only with TGFB"),
+             colour = "blue", size = 2,alpha = 0.7) +
+  geom_point(data=subset(common_gsea,Significance=="Only without TGFB"),
+             colour = "red", size = 2,alpha = 0.7) +
+  geom_label_repel(data = subset(common_gsea_new, Significance %in% c("Both", "Only with TGFB", "Only without TGFB")), aes(label=Description.x), size=2, color="black", fontface="bold",  min.segment.length = unit(1, "lines"), max.overlaps = Inf)+
+  xlim(-4,4)+
+  ylim(-4,4)+
+  xlab("NES of the Signature in C11MTvsWT (TRAF6 WTs)")+
+  ylab("NES of the Signature in C11MTvsWT (TRAF6 KOs)")
+dev.off()
+```
+
